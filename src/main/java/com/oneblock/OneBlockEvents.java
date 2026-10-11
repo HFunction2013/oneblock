@@ -2,11 +2,13 @@ package com.oneblock;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.LevelAccessor;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
@@ -88,8 +90,15 @@ public class OneBlockEvents {
     /** Dimension + chunk position, used as a map key so dimensions do not collide. */
     private record ChunkKey(ResourceKey<Level> dimension, ChunkPos pos) {}
 
-    /** A chunk waiting to be rewritten (held by level + pos so unloads can be detected). */
-    private record PendingChunk(ServerLevel level, ChunkPos pos, Block block) {}
+    /**
+     * NBT data extracted from a chunk whose ChunkDataEvent.Load had a null level
+     * (happens during off-thread deserialization). Applied later in onChunkLoad
+     * where the dimension is known.
+     */
+    private record PendingNBT(boolean done, String override) {}
+
+    /** A chunk waiting to be rewritten; holds the LevelChunk reference directly. */
+    private record PendingChunk(LevelChunk chunk, Block block) {}
 
     /** Chunks whose replacement state is already final (saved or processed this session). */
     private static final Set<ChunkKey> PROCESSED = new HashSet<>();
@@ -103,6 +112,13 @@ public class OneBlockEvents {
     /** FIFO queue of chunks awaiting replacement, drained at {@link #MAX_CHUNKS_PER_TICK}/tick. */
     private static final Queue<PendingChunk> PENDING = new ArrayDeque<>();
 
+    /**
+     * NBT data for chunks whose ChunkDataEvent.Load fired with a null level.
+     * Keyed by plain ChunkPos (dimension unknown at that point); consumed and
+     * removed in onChunkLoad where the dimension becomes available.
+     */
+    private static final Map<ChunkPos, PendingNBT> TEMP_NBT = new HashMap<>();
+
     @SubscribeEvent
     public void onServerStarted(ServerStartedEvent event) {
         // Seed the refresh RNG with the world's start time (time(NULL)).
@@ -111,19 +127,32 @@ public class OneBlockEvents {
 
     @SubscribeEvent
     public void onChunkDataLoad(ChunkDataEvent.Load event) {
-        if (event.getLevel().isClientSide()) {
+        LevelAccessor levelAccessor = event.getLevel();
+        ChunkPos pos = event.getChunk().getPos();
+        CompoundTag data = event.getData();
+
+        if (levelAccessor == null) {
+            // ChunkSerializer.read can fire this event during off-thread
+            // deserialization with a null level. Stash the NBT and apply it
+            // in onChunkLoad where the dimension is known.
+            TEMP_NBT.put(pos, new PendingNBT(
+                    data.contains(NBT_DONE),
+                    data.getString(NBT_OVERRIDE)));
             return;
         }
-        Level level = (Level) event.getLevel();
-        ChunkKey key = new ChunkKey(level.dimension(), event.getChunk().getPos());
-        String override = event.getData().getString(NBT_OVERRIDE);
+        if (levelAccessor.isClientSide()) {
+            return;
+        }
+
+        ChunkKey key = new ChunkKey(((Level) levelAccessor).dimension(), pos);
+        String override = data.getString(NBT_OVERRIDE);
         if (!override.isEmpty()) {
             Block block = blockFromKey(override);
             if (block != null) {
                 OVERRIDES.put(key, block);
             }
         }
-        if (event.getData().contains(NBT_DONE)) {
+        if (data.contains(NBT_DONE)) {
             PROCESSED.add(key);
         }
     }
@@ -142,6 +171,21 @@ public class OneBlockEvents {
         }
 
         ChunkKey key = new ChunkKey(level.dimension(), chunk.getPos());
+
+        // Apply any NBT that was stashed because ChunkDataEvent.Load had a null level.
+        PendingNBT pending = TEMP_NBT.remove(chunk.getPos());
+        if (pending != null) {
+            if (pending.done()) {
+                PROCESSED.add(key);
+            }
+            if (!pending.override().isEmpty()) {
+                Block block = blockFromKey(pending.override());
+                if (block != null) {
+                    OVERRIDES.put(key, block);
+                }
+            }
+        }
+
         if (PROCESSED.contains(key) || QUEUED.contains(key)) {
             return; // Already replaced, saved, or already waiting in the queue.
         }
@@ -149,13 +193,14 @@ public class OneBlockEvents {
         Block block = OVERRIDES.getOrDefault(key,
                 pickBlockForChunk(serverLevel.getSeed(), key.pos.x, key.pos.z));
         QUEUED.add(key);
-        PENDING.add(new PendingChunk(serverLevel, key.pos, block));
+        PENDING.add(new PendingChunk(chunk, block));
     }
 
     /**
      * Drains the pending queue at a bounded rate so the main thread is never
-     * blocked rewriting many chunks at once. Chunks that were unloaded before
-     * their turn are skipped (they will be re-enqueued on next load).
+     * blocked rewriting many chunks at once. The LevelChunk reference is held
+     * directly (no getChunkNow lookup); chunks unloaded before their turn are
+     * detected via isLoaded and skipped, then re-enqueued on next load.
      */
     @SubscribeEvent
     public void onServerTick(TickEvent.ServerTickEvent event) {
@@ -165,14 +210,13 @@ public class OneBlockEvents {
         int budget = MAX_CHUNKS_PER_TICK;
         PendingChunk task;
         while (budget > 0 && (task = PENDING.poll()) != null) {
-            ChunkKey key = new ChunkKey(task.level().dimension(), task.pos());
+            LevelChunk chunk = task.chunk();
+            ChunkKey key = new ChunkKey(chunk.getLevel().dimension(), chunk.getPos());
             QUEUED.remove(key);
 
-            LevelChunk chunk = task.level().getChunkSource().getChunkNow(
-                    task.pos().x, task.pos().z);
-            if (chunk == null) {
-                // Chunk was unloaded before we got to it; it will be re-enqueued
-                // on its next load (it is not yet in PROCESSED).
+            if (!chunk.getLevel().isLoaded(chunk.getPos().getWorldPosition())) {
+                // Chunk was unloaded before we got to it; it is not in PROCESSED
+                // yet, so it will be re-enqueued on its next load.
                 continue;
             }
 
@@ -184,11 +228,12 @@ public class OneBlockEvents {
 
     @SubscribeEvent
     public void onChunkDataSave(ChunkDataEvent.Save event) {
-        if (event.getLevel().isClientSide()) {
+        LevelAccessor levelAccessor = event.getLevel();
+        if (levelAccessor == null || levelAccessor.isClientSide()) {
             return;
         }
-        Level level = (Level) event.getLevel();
-        ChunkKey key = new ChunkKey(level.dimension(), event.getChunk().getPos());
+        ChunkKey key = new ChunkKey(
+                ((Level) levelAccessor).dimension(), event.getChunk().getPos());
         if (!PROCESSED.contains(key)) {
             return;
         }
