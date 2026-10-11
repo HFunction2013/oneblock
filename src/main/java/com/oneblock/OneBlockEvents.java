@@ -10,6 +10,8 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.LevelChunkSection;
+import net.minecraft.world.level.chunk.PalettedContainer;
 import net.minecraftforge.event.level.ChunkDataEvent;
 import net.minecraftforge.event.level.ChunkEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
@@ -164,12 +166,18 @@ public class OneBlockEvents {
      * Air, bedrock, barriers and blocks that already match are left alone, so
      * the terrain and building shapes are preserved and only the material
      * changes. Block entities of replaced blocks are removed.
+     *
+     * <p>Instead of calling {@code LevelChunk.setBlockState} once per block
+     * (which allocates a BlockPos, updates heightmaps and touches the block
+     * entity bookkeeping for every one of the ~98k positions), the blocks are
+     * written straight into each section's palette storage. Every candidate
+     * block is a full opaque cube, so neither the heightmaps nor the section
+     * air/solid counts change when material replaces material — skipping that
+     * overhead is safe and makes world creation finish instead of appearing to
+     * hang at 100% while the spawn chunks are converted.
      */
     public static void replaceChunkBlocks(LevelChunk chunk, Block block) {
         BlockState target = block.defaultBlockState();
-        Level level = chunk.getLevel();
-        int minY = level.getMinBuildHeight();
-        int maxY = level.getMaxBuildHeight();
 
         // Drop tile entities whose blocks are about to be replaced.
         Set<BlockPos> blockEntityPositions = new HashSet<>(chunk.getBlockEntities().keySet());
@@ -179,21 +187,23 @@ public class OneBlockEvents {
             }
         }
 
-        // Fast pass over the whole chunk: no neighbor updates, no relight, no
-        // client packets (the chunk is still being built when this runs).
-        for (int x = 0; x < 16; x++) {
-            for (int z = 0; z < 16; z++) {
-                for (int y = minY; y < maxY; y++) {
-                    BlockPos pos = new BlockPos(x, y, z);
-                    Block current = chunk.getBlockState(pos).getBlock();
-                    if (current == Blocks.AIR
-                            || current == Blocks.BEDROCK
-                            || current == Blocks.BARRIER
-                            || current == block) {
-                        continue;
-                    }
-                    chunk.setBlockState(pos, target, false);
+        for (LevelChunkSection section : chunk.getSections()) {
+            if (section.hasOnlyAir()) {
+                continue; // Nothing to replace in an empty section.
+            }
+            PalettedContainer<BlockState> states = section.getStates();
+            for (int i = 0; i < 4096; i++) {
+                int x = i & 15;
+                int z = (i >> 4) & 15;
+                int y = (i >> 8) & 15;
+                Block current = states.get(x, y, z).getBlock();
+                if (current == Blocks.AIR
+                        || current == Blocks.BEDROCK
+                        || current == Blocks.BARRIER
+                        || current == block) {
+                    continue;
                 }
+                states.getAndSet(x, y, z, target);
             }
         }
         chunk.setUnsaved(true);
