@@ -2,6 +2,7 @@ package com.oneblock;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.ChunkPos;
@@ -12,15 +13,18 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.chunk.PalettedContainer;
+import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.level.ChunkDataEvent;
 import net.minecraftforge.event.level.ChunkEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 
+import java.util.ArrayDeque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.Random;
 import java.util.Set;
 
@@ -34,6 +38,8 @@ import java.util.Set;
  *    terrain, caves and buildings keep their exact shape.
  *  - Performance: section-level writes, no neighbor updates, no relight and no
  *    per-block client packets, because the chunk is still being sent to clients.
+ *  - Throttled: at most {@link #MAX_CHUNKS_PER_TICK} chunks are rewritten per
+ *    server tick so exploring new terrain does not stall the main thread.
  *  - /oneblock:refreshzone re-rolls the current chunk with a non-seed RNG that
  *    is seeded once with time(NULL) when the server starts. Refreshed choices
  *    are persisted into the chunk NBT via ChunkDataEvent.
@@ -43,6 +49,9 @@ public class OneBlockEvents {
     /** NBT keys written into chunk data on save (via ChunkDataEvent). */
     public static final String NBT_DONE = "oneblock_done";
     public static final String NBT_OVERRIDE = "oneblock_override";
+
+    /** Maximum chunks rewritten in a single server tick (main-thread budget). */
+    private static final int MAX_CHUNKS_PER_TICK = 2;
 
     /** Curated candidate pool (no air, fluids, bedrock, barriers or tile entities). */
     public static final List<Block> BLOCKS = List.of(
@@ -76,11 +85,23 @@ public class OneBlockEvents {
     /** Non-seed RNG for /oneblock:refreshzone, seeded with time(NULL) at server start. */
     private static Random refreshRandom;
 
-    /** Chunks whose replacement state is already final (saved or processed this session). */
-    private static final Set<ChunkPos> PROCESSED = new HashSet<>();
+    /** Dimension + chunk position, used as a map key so dimensions do not collide. */
+    private record ChunkKey(ResourceKey<Level> dimension, ChunkPos pos) {}
 
-    /** Chunks with a manual /oneblock:refreshzone override (chunk pos -> block). */
-    private static final Map<ChunkPos, Block> OVERRIDES = new HashMap<>();
+    /** A chunk waiting to be rewritten (held by level + pos so unloads can be detected). */
+    private record PendingChunk(ServerLevel level, ChunkPos pos, Block block) {}
+
+    /** Chunks whose replacement state is already final (saved or processed this session). */
+    private static final Set<ChunkKey> PROCESSED = new HashSet<>();
+
+    /** Chunks currently queued for throttled replacement (prevents duplicate enqueues). */
+    private static final Set<ChunkKey> QUEUED = new HashSet<>();
+
+    /** Chunks with a manual /oneblock:refreshzone override (key -> block). */
+    private static final Map<ChunkKey, Block> OVERRIDES = new HashMap<>();
+
+    /** FIFO queue of chunks awaiting replacement, drained at {@link #MAX_CHUNKS_PER_TICK}/tick. */
+    private static final Queue<PendingChunk> PENDING = new ArrayDeque<>();
 
     @SubscribeEvent
     public void onServerStarted(ServerStartedEvent event) {
@@ -93,16 +114,17 @@ public class OneBlockEvents {
         if (event.getLevel().isClientSide()) {
             return;
         }
-        ChunkPos pos = event.getChunk().getPos();
+        Level level = (Level) event.getLevel();
+        ChunkKey key = new ChunkKey(level.dimension(), event.getChunk().getPos());
         String override = event.getData().getString(NBT_OVERRIDE);
         if (!override.isEmpty()) {
             Block block = blockFromKey(override);
             if (block != null) {
-                OVERRIDES.put(pos, block);
+                OVERRIDES.put(key, block);
             }
         }
         if (event.getData().contains(NBT_DONE)) {
-            PROCESSED.add(pos);
+            PROCESSED.add(key);
         }
     }
 
@@ -115,16 +137,49 @@ public class OneBlockEvents {
         if (!(event.getChunk() instanceof LevelChunk chunk)) {
             return; // Chunk is not fully generated yet; the full Load follows.
         }
-
-        ChunkPos pos = chunk.getPos();
-        if (PROCESSED.contains(pos)) {
-            return; // Already replaced on a previous load; the saved state is final.
+        if (!(level instanceof ServerLevel serverLevel)) {
+            return;
         }
 
-        Block block = OVERRIDES.getOrDefault(pos,
-                pickBlockForChunk(((ServerLevel) level).getSeed(), pos.x, pos.z));
-        PROCESSED.add(pos);
-        replaceChunkBlocks(chunk, block);
+        ChunkKey key = new ChunkKey(level.dimension(), chunk.getPos());
+        if (PROCESSED.contains(key) || QUEUED.contains(key)) {
+            return; // Already replaced, saved, or already waiting in the queue.
+        }
+
+        Block block = OVERRIDES.getOrDefault(key,
+                pickBlockForChunk(serverLevel.getSeed(), key.pos.x, key.pos.z));
+        QUEUED.add(key);
+        PENDING.add(new PendingChunk(serverLevel, key.pos, block));
+    }
+
+    /**
+     * Drains the pending queue at a bounded rate so the main thread is never
+     * blocked rewriting many chunks at once. Chunks that were unloaded before
+     * their turn are skipped (they will be re-enqueued on next load).
+     */
+    @SubscribeEvent
+    public void onServerTick(TickEvent.ServerTickEvent event) {
+        if (event.phase != TickEvent.Phase.END || PENDING.isEmpty()) {
+            return;
+        }
+        int budget = MAX_CHUNKS_PER_TICK;
+        PendingChunk task;
+        while (budget > 0 && (task = PENDING.poll()) != null) {
+            ChunkKey key = new ChunkKey(task.level().dimension(), task.pos());
+            QUEUED.remove(key);
+
+            LevelChunk chunk = task.level().getChunkSource().getChunkNow(
+                    task.pos().x, task.pos().z);
+            if (chunk == null) {
+                // Chunk was unloaded before we got to it; it will be re-enqueued
+                // on its next load (it is not yet in PROCESSED).
+                continue;
+            }
+
+            PROCESSED.add(key);
+            replaceChunkBlocks(chunk, task.block());
+            budget--;
+        }
     }
 
     @SubscribeEvent
@@ -132,12 +187,13 @@ public class OneBlockEvents {
         if (event.getLevel().isClientSide()) {
             return;
         }
-        ChunkPos pos = event.getChunk().getPos();
-        if (!PROCESSED.contains(pos)) {
+        Level level = (Level) event.getLevel();
+        ChunkKey key = new ChunkKey(level.dimension(), event.getChunk().getPos());
+        if (!PROCESSED.contains(key)) {
             return;
         }
         event.getData().putBoolean(NBT_DONE, true);
-        Block override = OVERRIDES.get(pos);
+        Block override = OVERRIDES.get(key);
         if (override != null) {
             event.getData().putString(NBT_OVERRIDE, keyOf(override));
         }
@@ -156,9 +212,10 @@ public class OneBlockEvents {
     }
 
     /** Records a manual refresh override so it survives save/reload cycles. */
-    public static void applyOverride(ChunkPos pos, Block block) {
-        OVERRIDES.put(pos, block);
-        PROCESSED.add(pos);
+    public static void applyOverride(Level level, ChunkPos pos, Block block) {
+        ChunkKey key = new ChunkKey(level.dimension(), pos);
+        OVERRIDES.put(key, block);
+        PROCESSED.add(key);
     }
 
     /**

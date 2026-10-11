@@ -39,7 +39,7 @@ public class RefreshZoneCommand {
                                     .get(random.nextInt(OneBlockEvents.BLOCKS.size()));
 
                             ChunkPos pos = chunk.getPos();
-                            OneBlockEvents.applyOverride(pos, block);
+                            OneBlockEvents.applyOverride(player.level(), pos, block);
                             OneBlockEvents.replaceChunkBlocks(chunk, block);
 
                             context.getSource().sendSuccess(() -> Component.literal(
