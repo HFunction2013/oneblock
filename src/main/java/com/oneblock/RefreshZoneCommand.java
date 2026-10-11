@@ -5,6 +5,7 @@ import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraftforge.event.RegisterCommandsEvent;
@@ -17,8 +18,8 @@ import java.util.Random;
  *
  * Re-rolls the block of the chunk the player is currently standing in with the
  * session RNG (seeded from time(NULL) when the server started), NOT from the
- * world seed. The refreshed choice is stored in the chunk and stays after
- * reloading the world.
+ * world seed. The refreshed choice is stored in the chunk data and survives
+ * saving and reloading the world.
  */
 public class RefreshZoneCommand {
 
@@ -37,12 +38,12 @@ public class RefreshZoneCommand {
                             Block block = OneBlockEvents.BLOCKS
                                     .get(random.nextInt(OneBlockEvents.BLOCKS.size()));
 
-                            chunk.getPersistentData().putString(OneBlockEvents.KEY_BLOCK,
-                                    OneBlockEvents.keyOf(block));
+                            ChunkPos pos = chunk.getPos();
+                            OneBlockEvents.applyOverride(pos, block);
                             OneBlockEvents.replaceChunkBlocks(chunk, block);
 
                             context.getSource().sendSuccess(() -> Component.literal(
-                                    "Refreshed chunk [" + chunk.getPos().x + ", " + chunk.getPos().z
+                                    "Refreshed chunk [" + pos.x + ", " + pos.z
                                             + "] as " + block.getName().getString() + "."), true);
                             return 1;
                         }));

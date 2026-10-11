@@ -2,20 +2,23 @@ package com.oneblock;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
-import net.minecraft.nbt.CompoundTag;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraftforge.event.level.ChunkDataEvent;
 import net.minecraftforge.event.level.ChunkEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 
@@ -30,12 +33,14 @@ import java.util.Set;
  *  - Performance: section-level writes, no neighbor updates, no relight and no
  *    per-block client packets, because the chunk is still being sent to clients.
  *  - /oneblock:refreshzone re-rolls the current chunk with a non-seed RNG that
- *    is seeded once with time(NULL) when the server starts.
+ *    is seeded once with time(NULL) when the server starts. Refreshed choices
+ *    are persisted into the chunk NBT via ChunkDataEvent.
  */
 public class OneBlockEvents {
 
-    /** Chunk persistent-data key holding the chosen block. */
-    public static final String KEY_BLOCK = "oneblock.block";
+    /** NBT keys written into chunk data on save (via ChunkDataEvent). */
+    public static final String NBT_DONE = "oneblock_done";
+    public static final String NBT_OVERRIDE = "oneblock_override";
 
     /** Curated candidate pool (no air, fluids, bedrock, barriers or tile entities). */
     public static final List<Block> BLOCKS = List.of(
@@ -69,6 +74,12 @@ public class OneBlockEvents {
     /** Non-seed RNG for /oneblock:refreshzone, seeded with time(NULL) at server start. */
     private static Random refreshRandom;
 
+    /** Chunks whose replacement state is already final (saved or processed this session). */
+    private static final Set<ChunkPos> PROCESSED = new HashSet<>();
+
+    /** Chunks with a manual /oneblock:refreshzone override (chunk pos -> block). */
+    private static final Map<ChunkPos, Block> OVERRIDES = new HashMap<>();
+
     @SubscribeEvent
     public void onServerStarted(ServerStartedEvent event) {
         // Seed the refresh RNG with the world's start time (time(NULL)).
@@ -76,8 +87,26 @@ public class OneBlockEvents {
     }
 
     @SubscribeEvent
+    public void onChunkDataLoad(ChunkDataEvent.Load event) {
+        if (event.getLevel().isClientSide()) {
+            return;
+        }
+        ChunkPos pos = event.getChunk().getPos();
+        String override = event.getData().getString(NBT_OVERRIDE);
+        if (!override.isEmpty()) {
+            Block block = blockFromKey(override);
+            if (block != null) {
+                OVERRIDES.put(pos, block);
+            }
+        }
+        if (event.getData().contains(NBT_DONE)) {
+            PROCESSED.add(pos);
+        }
+    }
+
+    @SubscribeEvent
     public void onChunkLoad(ChunkEvent.Load event) {
-        Level level = event.getLevel();
+        Level level = (Level) event.getLevel();
         if (level.isClientSide) {
             return; // The server is authoritative for the replacement.
         }
@@ -85,17 +114,31 @@ public class OneBlockEvents {
             return; // Chunk is not fully generated yet; the full Load follows.
         }
 
-        CompoundTag data = chunk.getPersistentData();
-        if (data.contains(KEY_BLOCK)) {
-            return; // Already processed on a previous load; the saved state is final.
+        ChunkPos pos = chunk.getPos();
+        if (PROCESSED.contains(pos)) {
+            return; // Already replaced on a previous load; the saved state is final.
         }
 
-        Block block = pickBlockForChunk(((ServerLevel) level).getSeed(),
-                chunk.getPos().x, chunk.getPos().z);
-        data.putString(KEY_BLOCK, keyOf(block));
-        chunk.setUnsaved(true);
-
+        Block block = OVERRIDES.getOrDefault(pos,
+                pickBlockForChunk(((ServerLevel) level).getSeed(), pos.x, pos.z));
+        PROCESSED.add(pos);
         replaceChunkBlocks(chunk, block);
+    }
+
+    @SubscribeEvent
+    public void onChunkDataSave(ChunkDataEvent.Save event) {
+        if (event.getLevel().isClientSide()) {
+            return;
+        }
+        ChunkPos pos = event.getChunk().getPos();
+        if (!PROCESSED.contains(pos)) {
+            return;
+        }
+        event.getData().putBoolean(NBT_DONE, true);
+        Block override = OVERRIDES.get(pos);
+        if (override != null) {
+            event.getData().putString(NBT_OVERRIDE, keyOf(override));
+        }
     }
 
     /**
@@ -108,6 +151,12 @@ public class OneBlockEvents {
                 + (long) chunkZ * 132897987541L;
         Random random = new Random(hash);
         return BLOCKS.get(random.nextInt(BLOCKS.size()));
+    }
+
+    /** Records a manual refresh override so it survives save/reload cycles. */
+    public static void applyOverride(ChunkPos pos, Block block) {
+        OVERRIDES.put(pos, block);
+        PROCESSED.add(pos);
     }
 
     /**
@@ -123,7 +172,7 @@ public class OneBlockEvents {
         int maxY = level.getMaxBuildHeight();
 
         // Drop tile entities whose blocks are about to be replaced.
-        Set<BlockPos> blockEntityPositions = new HashSet<>(chunk.getBlockEntitiesPositions());
+        Set<BlockPos> blockEntityPositions = new HashSet<>(chunk.getBlockEntities().keySet());
         for (BlockPos pos : blockEntityPositions) {
             if (chunk.getBlockState(pos).getBlock() != block) {
                 chunk.removeBlockEntity(pos);
